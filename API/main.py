@@ -1,3 +1,4 @@
+
 import os
 from io import BytesIO
 
@@ -5,7 +6,7 @@ import numpy as np
 import tensorflow as tf
 import uvicorn
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -16,8 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="Potato Disease Classification API",
-    description="Upload a potato leaf image to predict its disease.",
-    version="1.0.0"
+    description="Validate a potato leaf image and predict its disease.",
+    version="1.2.0"
 )
 
 
@@ -39,7 +40,7 @@ app.add_middleware(
 
 
 # --------------------------------------------------
-# 3. Load the trained model
+# 3. Model paths and loading
 # --------------------------------------------------
 
 PROJECT_DIR = os.path.dirname(
@@ -51,19 +52,24 @@ MODEL_PATH = os.path.join(
     "potato_disease_model.keras"
 )
 
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(
-        f"Model file not found: {MODEL_PATH}"
-    )
+VALIDATOR_PATH = os.path.join(
+    PROJECT_DIR,
+    "potato_leaf_validator_v2.keras"
+)
+
+for path in [MODEL_PATH, VALIDATOR_PATH]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file not found: {path}")
 
 MODEL = tf.keras.models.load_model(MODEL_PATH)
+VALIDATOR = tf.keras.models.load_model(VALIDATOR_PATH)
 
 print("Potato disease model loaded successfully!")
+print("Potato leaf validator V2 loaded successfully!")
 
 
 # --------------------------------------------------
-# 4. Define class names
-# IMPORTANT: Keep the same order as during training
+# 4. Class names and settings
 # --------------------------------------------------
 
 CLASS_NAMES = [
@@ -72,34 +78,48 @@ CLASS_NAMES = [
     "Potato___healthy"
 ]
 
-IMAGE_SIZE = 256
+DISEASE_IMAGE_SIZE = 256
+VALIDATOR_IMAGE_SIZE = 128
+
+# Initial experimental thresholds
+LEAF_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.80
 
 
 # --------------------------------------------------
-# 5. Convert uploaded image into a NumPy ndarray
+# 5. Read and preprocess uploaded images
 # --------------------------------------------------
 
-def read_file_as_image(data: bytes) -> np.ndarray:
-    image = Image.open(BytesIO(data)).convert("RGB")
+def read_uploaded_image(data: bytes):
+    try:
+        with Image.open(BytesIO(data)) as img:
+            image = img.convert("RGB")
 
-    image = image.resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
-    )
+            # Disease model preprocessing: 256 x 256, 0-255
+            disease_image = image.resize(
+                (DISEASE_IMAGE_SIZE, DISEASE_IMAGE_SIZE)
+            )
+            disease_array = np.array(disease_image)
 
-    image_array = np.array(image)
+            # Validator preprocessing: 128 x 128, normalized 0-1
+            validator_image = image.resize(
+                (VALIDATOR_IMAGE_SIZE, VALIDATOR_IMAGE_SIZE)
+            )
+            validator_array = (
+                np.array(validator_image, dtype=np.float32) / 255.0
+            )
 
-    print("\nImage uploaded successfully!")
-    print("Array shape:", image_array.shape)
-    print("Array data type:", image_array.dtype)
-    print("Array dimensions:", image_array.ndim)
-    print("First 5x5 pixels:")
-    print(image_array[:5, :5, :])
+        return disease_array, validator_array
 
-    return image_array
+    except (UnidentifiedImageError, OSError, ValueError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a valid image."
+        ) from e
 
 
 # --------------------------------------------------
-# 6. Test endpoint
+# 6. Health-check endpoint
 # --------------------------------------------------
 
 @app.get("/ping")
@@ -116,20 +136,20 @@ async def ping():
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
 
-    # Validate the uploaded file type
-    if file.content_type not in [
+    allowed_types = {
         "image/jpeg",
         "image/png",
         "image/jpg",
         "image/webp"
-    ]:
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload a JPG, JPEG, PNG, or WEBP image."
-        )
+    }
 
     try:
-        # Read the uploaded image
+        if file.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=400,
+                detail="Please upload a JPG, JPEG, PNG, or WEBP image."
+            )
+
         image_bytes = await file.read()
 
         if not image_bytes:
@@ -138,53 +158,113 @@ async def predict(file: UploadFile = File(...)):
                 detail="The uploaded file is empty."
             )
 
-        # Convert image to NumPy ndarray
-        image = read_file_as_image(image_bytes)
+        # Preprocess the same image for both models
+        disease_image, validator_image = read_uploaded_image(image_bytes)
 
-        # Add batch dimension:
-        # (256, 256, 3) -> (1, 256, 256, 3)
-        img_batch = np.expand_dims(image, axis=0)
+        disease_batch = np.expand_dims(disease_image, axis=0)
+        validator_batch = np.expand_dims(validator_image, axis=0)
 
-        print("Batch shape:", img_batch.shape)
+        # --------------------------------------------------
+        # Stage 1: Check whether the image is a potato leaf
+        # --------------------------------------------------
 
-        # Make prediction
-        predictions = MODEL.predict(
-            img_batch,
+        leaf_predictions = VALIDATOR.predict(
+            validator_batch,
             verbose=0
         )
 
-        # Get predicted class and confidence
-        predicted_index = int(
-            np.argmax(predictions[0])
+        if (
+            leaf_predictions.size != 1
+            or not np.all(np.isfinite(leaf_predictions))
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail="The leaf validator returned an invalid prediction."
+            )
+
+        leaf_score = float(leaf_predictions.reshape(-1)[0])
+
+        if not 0.0 <= leaf_score <= 1.0:
+            raise HTTPException(
+                status_code=500,
+                detail="The leaf validator returned an invalid score."
+            )
+
+        print("Potato-leaf score:", leaf_score)
+
+        if leaf_score < LEAF_THRESHOLD:
+            return {
+                "filename": file.filename,
+                "is_potato_leaf": False,
+                "leaf_score": leaf_score,
+                "class": "Not a potato leaf",
+                "message": (
+                    "This image was not recognized as a potato leaf. "
+                    "Please upload a clear potato leaf image."
+                )
+            }
+
+        # --------------------------------------------------
+        # Stage 2: Predict the potato disease
+        # --------------------------------------------------
+
+        predictions = MODEL.predict(
+            disease_batch,
+            verbose=0
         )
 
-        predicted_class = CLASS_NAMES[predicted_index]
+        if (
+            predictions.ndim != 2
+            or predictions.shape[0] != 1
+            or predictions.shape[1] != len(CLASS_NAMES)
+            or not np.all(np.isfinite(predictions))
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail="The disease model returned an invalid prediction."
+            )
 
-        confidence = float(
-            np.max(predictions[0])
-        )
+        predicted_index = int(np.argmax(predictions[0]))
+        confidence = float(np.max(predictions[0]))
 
-        print("Predicted class:", predicted_class)
-        print("Confidence:", confidence)
+        print("Predicted class:", CLASS_NAMES[predicted_index])
+        print("Disease model confidence:", confidence)
 
-        # Return result to Postman
+        if confidence < CONFIDENCE_THRESHOLD:
+            return {
+                "filename": file.filename,
+                "is_potato_leaf": True,
+                "leaf_score": leaf_score,
+                "class": "Uncertain prediction",
+                "confidence": confidence,
+                "message": (
+                    "The image passed leaf validation, but the disease "
+                    "prediction confidence is too low. Please try a "
+                    "clearer potato leaf image."
+                )
+            }
+
         return {
             "filename": file.filename,
-            "class": predicted_class,
+            "is_potato_leaf": True,
+            "leaf_score": leaf_score,
+            "class": CLASS_NAMES[predicted_index],
             "confidence": confidence,
-            "image_shape": list(image.shape),
-            "image_dtype": str(image.dtype),
-            "batch_shape": list(img_batch.shape)
+            "message": "Prediction completed successfully."
         }
 
     except HTTPException:
         raise
 
     except Exception as e:
+        print("Prediction error:", str(e))
         raise HTTPException(
-            status_code=400,
-            detail=f"Could not process image: {str(e)}"
-        )
+            status_code=500,
+            detail="An error occurred while processing the image."
+        ) from e
+
+    finally:
+        await file.close()
 
 
 # --------------------------------------------------

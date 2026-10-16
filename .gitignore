@@ -1,4 +1,4 @@
-```gitignore
+
 # Python
 .venv/
 venv/
@@ -22,8 +22,11 @@ frontend/coverage/
 # IDE
 .idea/
 
-# Dataset
+
+# Datasets
 PlantVillage/
+cifar-10-batches-py/
+leaf_validator_dataset/
 
 # Logs
 *.log
@@ -31,4 +34,3 @@ PlantVillage/
 # OS files
 .DS_Store
 Thumbs.db
-```
