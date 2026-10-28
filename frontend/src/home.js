@@ -32,7 +32,7 @@ import Clear from "@material-ui/icons/Clear";
 import cblogo from "./cblogo.PNG";
 import backgroundImage from "./bg.png";
 
-const API_URL = "http://127.0.0.1:8000/predict";
+const API_URL = "http://127.0.0.1:8001/predict";
 
 const ColorButton = withStyles((theme) => ({
   root: {
